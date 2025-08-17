@@ -1,10 +1,3 @@
-# ==============================
-# File: train.py
-# Purpose: Load parquet features, build a CNN (64, 32, 32 conv layers)
-#          with regularization, and train a binary classifier
-#          (footstep vs not-footstep) in TensorFlow/Keras.
-# ==============================
-
 import argparse
 import json
 import os
@@ -26,7 +19,6 @@ def load_parquet(path: Path):
         arr = np.array(feat, dtype=np.float32).reshape((fb, tfm))
         X.append(arr)
     X = np.stack(X, axis=0)
-    # Ensure a pure NumPy 1D array (avoid pandas ExtensionArray causing Pylance/typing issues)
     y = df["label"].astype(int).to_numpy(copy=True).reshape(-1)
     return X, y, df
 
@@ -105,30 +97,7 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    callbacks = [
-        keras.callbacks.EarlyStopping(
-            patience=5, restore_best_weights=True, monitor="val_auc", mode="max"
-        ),
-        keras.callbacks.ModelCheckpoint(
-            str(out_dir / "footstep_cnn.keras"),
-            monitor="val_auc",
-            mode="max",
-            save_best_only=True,
-        ),
-        keras.callbacks.ReduceLROnPlateau(patience=3, factor=0.5, monitor="val_loss"),
-    ]
-
-    history = model.fit(
-        X_tr,
-        y_tr,
-        validation_data=(X_va, y_va),
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        callbacks=callbacks,
-        verbose=1,
-    )
-
-    # Save training artifacts
+    # Save
     model.save(str(out_dir / "final_cnn.keras"))
     with open(out_dir / "norm.json", "w") as f:
         json.dump({"mean": mean, "std": std, "input_shape": list(input_shape)}, f)

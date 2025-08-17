@@ -1,9 +1,3 @@
-# ==============================
-# File: server.py (FastAPI backend)
-# Purpose: Receive live audio chunks (~0.5s), buffer per session, run the
-#          last 1.5s window through the CNN, and return footstep probability.
-# ==============================
-
 import os
 import io
 import json
