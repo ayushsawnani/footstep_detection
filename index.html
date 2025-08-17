@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Live Footstep Detector</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
+    button { padding: 10px 16px; border-radius: 10px; border: 0; cursor: pointer; }
+    #log { margin-top: 16px; }
+    .row { display: flex; gap: 12px; align-items: center; margin-top: 12px; }
+    .pill { padding: 6px 10px; border-radius: 999px; background: #efefef; }
+    ul { margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Live Footstep Detector</h1>
+  <div class="row">
+    <button id="start">Start Recording</button>
+    <button id="stop" disabled>Stop</button>
+    <span class="pill">Threshold: <input id="thr" type="number" value="0.5" step="0.05" min="0" max="1" style="width:80px"/></span>
+    <span id="status" class="pill">idle</span>
+  </div>
+
+  <div id="log">
+    <h3>Detections (timestamps in seconds)</h3>
+    <ul id="detections"></ul>
+  </div>
+
+  <script>
+    const BACKEND = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+      ? 'http://localhost:8000'
+      : location.origin; // adjust if deploying separately
+
+    const startBtn = document.getElementById('start');
+    const stopBtn = document.getElementById('stop');
+    const statusEl = document.getElementById('status');
+    const detectionsEl = document.getElementById('detections');
+    const thrEl = document.getElementById('thr');
+
+    let audioCtx, mic, workletNode;
+    let running = false;
+    let sessionId = Math.random().toString(36).slice(2);
+    let elapsedMs = 0; // accumulated audio time we sent
+    const HOP_MS = 500; // send every 0.5s
+
+    function msToSec(ms) { return (ms / 1000).toFixed(2); }
+
+    function ensureSecureContext() {
+      const isLocalhost = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+      if (!window.isSecureContext && !isLocalhost) {
+        alert('This page must be served over HTTPS or from http://localhost for the mic to work. Try running: python -m http.server and open http://localhost:8000 or similar.');
+        return false;
+      }
+      return true;
+    }
+
+    async function resetSession() {
+      await fetch(BACKEND + '/reset_session', { method: 'POST', headers: { 'X-Session': sessionId } });
+    }
+
+    async function start() {
+      if (running) return;
+      if (!ensureSecureContext()) { return; }
+      running = true;
+      elapsedMs = 0;
+      detectionsEl.innerHTML = '';
+      await resetSession();
+
+      statusEl.textContent = 'requesting mic…';
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: false }, video: false });
+      } catch (err) {
+        console.error('getUserMedia error', err);
+        statusEl.textContent = 'mic permission denied or unavailable';
+        running = false;
+        return;
+      }
+
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      try { await audioCtx.resume(); } catch (e) { console.warn('resume failed', e); }
+      mic = audioCtx.createMediaStreamSource(stream);
+
+      // Inline AudioWorklet (capture float32 frames to main thread)
+      const processorCode = `
+        class FootstepCapture extends AudioWorkletProcessor {
+          constructor() { super(); this.buf = []; this.bufLen = 0; this.lastSentTime = 0; }
+          process(inputs, outputs, parameters) {
+            const input = inputs[0];
+            if (input && input[0]) {
+              const ch0 = input[0]; // Float32Array length 128 per render quantum
+              this.buf.push(ch0.slice());
+              this.bufLen += ch0.length;
+              // send every ~0.5s worth of samples
+              const sr = sampleRate; // worklet global
+              const hopSamples = Math.round(0.5 * sr);
+              if (this.bufLen >= hopSamples) {
+                const merged = new Float32Array(this.bufLen);
+                let off = 0; for (const b of this.buf) { merged.set(b, off); off += b.length; }
+                // emit only the first hopSamples to keep cadence stable
+                const chunk = merged.subarray(0, hopSamples);
+                // keep remainder for next round
+                const remainder = merged.subarray(hopSamples);
+                this.buf = [remainder.slice()];
+                this.bufLen = remainder.length;
+                this.port.postMessage({ type: 'chunk', samples: chunk, sr });
+              }
+            }
+            return true; // keep alive
+          }
+        }
+        registerProcessor('footstep-capture', FootstepCapture);
+      `;
+
+      const blob = new Blob([processorCode], { type: 'application/javascript' });
+      const url = URL.createObjectURL(blob);
+      await audioCtx.audioWorklet.addModule(url);
+
+      if (!audioCtx.audioWorklet) {
+        alert('AudioWorklet is not supported in this browser. Try Chrome or Edge.');
+        running = false;
+        return;
+      }
+
+      workletNode = new AudioWorkletNode(audioCtx, 'footstep-capture');
+      workletNode.port.onmessage = async (e) => {
+        if (!running) return;
+        if (e.data?.type === 'chunk') {
+          const { samples, sr } = e.data;
+          elapsedMs += HOP_MS; // approx
+          // Send Float32 chunk as raw bytes
+          const buf = samples.buffer;
+          try {
+            const resp = await fetch(BACKEND + '/predict_chunk', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/octet-stream',
+                'X-Session': sessionId,
+                'X-SampleRate': String(sr),
+                'X-ElapsedMs': String(elapsedMs)
+              },
+              body: buf
+            });
+            const out = await resp.json();
+            const thr = parseFloat(thrEl.value || '0.5');
+            if (out?.prob >= thr) {
+              const li = document.createElement('li');
+              li.textContent = `${msToSec(out.t_end_ms)}s (p=${out.prob.toFixed(3)})`;
+              detectionsEl.appendChild(li);
+            }
+            statusEl.textContent = `p=${(out?.prob ?? 0).toFixed(3)} @ ${msToSec(elapsedMs)}s`;
+          } catch (err) {
+            console.error(err);
+            statusEl.textContent = 'error sending chunk';
+          }
+        }
+      };
+
+      const silentGain = audioCtx.createGain();
+      silentGain.gain.value = 0.0;
+      workletNode.connect(silentGain).connect(audioCtx.destination);
+      mic.connect(workletNode);
+      startBtn.disabled = true; stopBtn.disabled = false; statusEl.textContent = 'recording…';
+    }
+
+    async function stop() {
+      if (!running) return;
+      running = false;
+      try { workletNode.disconnect(); } catch {}
+      try { mic.disconnect(); } catch {}
+      try { await audioCtx.close(); } catch {}
+      startBtn.disabled = false; stopBtn.disabled = true; statusEl.textContent = 'stopped';
+    }
+
+    startBtn.onclick = start;
+    stopBtn.onclick = stop;
+  </script>
+</body>
+</html>

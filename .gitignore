@@ -1,0 +1,6 @@
+footstepDetectionDataset/
+preprocessing.py
+evaluate.py
+data/
+.venv/
+*.wav
