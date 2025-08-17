@@ -27,5 +27,5 @@ I built a small web application using HTML, JavaScript, and a FastAPI backend. T
 ## Future Plans
 
 - Expand dataset to include more examples of pure silence and background noise.
-- Move beyond binary classification to identify **whose footsteps** are being detected, e.g., distinguishing the author’s footsteps from others in the household.
+- Move beyond binary classification to identify **whose footsteps** are being detected
 - Integrate into a live application that continuously records, processes, and outputs detections in real-time.
